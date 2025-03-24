@@ -1,0 +1,406 @@
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+
+public class ClientHandler implements Runnable {
+    private Socket socket;
+    private BufferedReader in;
+    private PrintWriter out;
+    private User user; // The logged-in user
+    private boolean running = true;
+
+    // For driver clients: indicates if they are busy with a ride.
+    private boolean busy = false;
+
+    // For drivers: track the ride ID for which an offer has been sent.
+    // -1 means no current pending offer.
+    private int currentOfferRideId = -1;
+
+    public ClientHandler(Socket socket) {
+        this.socket = socket;
+        try {
+            in  = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            out = new PrintWriter(socket.getOutputStream(), true);
+        } catch(IOException e) {
+            System.err.println("ClientHandler error: " + e.getMessage());
+        }
+    }
+
+    public String getUserName() {
+        return user != null ? user.getUsername() : "unknown";
+    }
+
+    public boolean isBusy() {
+        return busy;
+    }
+
+    public void setBusy(boolean busy) {
+        this.busy = busy;
+    }
+
+    public int getCurrentOfferRideId() {
+        return currentOfferRideId;
+    }
+
+    public void clearCurrentOffer() {
+        this.currentOfferRideId = -1;
+    }
+
+    public void setCurrentOfferRideId(int rideId) {
+        this.currentOfferRideId = rideId;
+    }
+
+    public void sendMessage(String msg) {
+        out.println(msg);
+    }
+
+    @Override
+    public void run() {
+        try {
+            // Process login/registration first
+            while (user == null && running) {
+                String authMsg = in.readLine();
+                if (authMsg == null) break;
+
+                String[] tokens = authMsg.split(":");
+                if (tokens.length >= 2) {
+                    String command = tokens[0];
+
+                    if (command.equalsIgnoreCase("REGISTER")) {
+                        // Registration remains similar to before
+                        if (tokens.length >= 4) {
+                            String username = tokens[1];
+                            String password = tokens[2];
+                            String type = tokens[3];
+
+                            // Prevent registering as admin. Admin must log in.
+                            if (type.equalsIgnoreCase("admin")) {
+                                out.println("ERROR: Cannot register as admin. Please log in with admin credentials.");
+                            } else if (User.userExists(username)) {
+                                out.println("ERROR: Username already exists.");
+                            } else {
+                                user = new User(username, password, type);
+                                Server.users.add(user);
+                                out.println("REGISTERED:" + username);
+                                addToRoleList();
+                            }
+                        } else {
+                            out.println("ERROR: Invalid REGISTER format.");
+                        }
+                    } else if (command.equalsIgnoreCase("LOGIN")) {
+                        // Simplified login
+                        if (tokens.length >= 3) {
+                            String username = tokens[1];
+                            String password = tokens[2];
+
+                            User found = User.authenticate(username, password);
+                            if (found != null) {
+                                user = found;
+                                out.println("LOGGEDIN:" + username + ":" + user.getType());
+                                addToRoleList();
+                            } else {
+                                out.println("ERROR: Invalid credentials.");
+                            }
+                        } else {
+                            out.println("ERROR: Invalid LOGIN format.");
+                        }
+                    } else {
+                        out.println("ERROR: Unknown authentication command.");
+                    }
+                } else {
+                    out.println("ERROR: Invalid authentication format.");
+                }
+            }
+
+            // Main loop for handling commands after authentication
+            String line;
+            while (running && (line = in.readLine()) != null) {
+                System.out.println("From " + getUserName() + ": " + line);
+                String[] tokens = line.split(":");
+                if (tokens.length == 0) continue;
+                String command = tokens[0];
+                switch (command.toUpperCase()) {
+                    case "REQUEST":
+                        // Format: REQUEST:pickup:destination
+                        if (user.getType().equalsIgnoreCase("customer")) {
+                            // Check if customer already has an ongoing ride (status START)
+                            boolean ongoingRide = Server.rides.stream()
+                                    .anyMatch(r -> r.getCustomerHandler() == this && r.getStatus().equals("START"));
+                            if (ongoingRide) {
+                                out.println("ERROR: You are already in an ongoing ride. Cannot request a new ride.");
+                                break;
+                            }
+                            if (tokens.length >= 3) {
+                                String pickup = tokens[1];
+                                String destination = tokens[2];
+                                Ride ride = new Ride(pickup, destination, this);
+                                Server.rides.add(ride);
+                                out.println("REQUEST_RECEIVED:" + ride.getRideId());
+                                // Broadcast to available drivers
+                                broadcastRideRequest(ride);
+                            } else {
+                                out.println("ERROR: Invalid REQUEST format. Provide pickup and destination.");
+                            }
+                        } else {
+                            out.println("ERROR: Only customers can request rides.");
+                        }
+                        break;
+
+                    case "OFFER":
+                        // Format: OFFER:rideId:price
+                        if (user.getType().equalsIgnoreCase("driver")) {
+                            // Check if already offered to a ride
+                            if (currentOfferRideId != -1) {
+                                out.println("ERROR: You have already sent an offer for ride " + currentOfferRideId + ". Cannot send another offer.");
+                                break;
+                            }
+                            if (tokens.length >= 3) {
+                                int rideId;
+                                double price;
+                                try {
+                                    rideId = Integer.parseInt(tokens[1]);
+                                    price = Double.parseDouble(tokens[2]);
+                                } catch (NumberFormatException nfe) {
+                                    out.println("ERROR: Invalid rideId or price.");
+                                    break;
+                                }
+                                Ride ride = Ride.getRideById(rideId);
+                                if (ride != null && !ride.isAssigned()) {
+                                    ride.addOffer(this, price);
+                                    // Mark that this driver has a pending offer for this ride.
+                                    setCurrentOfferRideId(rideId);
+                                    out.println("OFFER_SENT for ride " + rideId);
+                                    // Notify the customer of the new offer.
+                                    ride.notifyCustomerOffers();
+                                } else {
+                                    out.println("ERROR: Ride not found or already assigned.");
+                                }
+                            } else {
+                                out.println("ERROR: Invalid OFFER format. Provide rideId and price.");
+                            }
+                        } else {
+                            out.println("ERROR: Only drivers can offer rides.");
+                        }
+                        break;
+
+                    case "ASSIGN":
+                        // Customer selects an offer: ASSIGN:rideId:driverUsername
+                        if (user.getType().equalsIgnoreCase("customer")) {
+                            if (tokens.length >= 3) {
+                                int rideId;
+                                try {
+                                    rideId = Integer.parseInt(tokens[1]);
+                                } catch (NumberFormatException nfe) {
+                                    out.println("ERROR: Invalid rideId.");
+                                    break;
+                                }
+                                // Check if this ride was actually requested by this customer
+                                Ride ride = Ride.getRideById(rideId);
+                                if (ride == null || ride.getCustomerHandler() != this) {
+                                    out.println("ERROR: You are not authorized to assign ride " + rideId + ".");
+                                    break;
+                                }
+                                String driverUsername = tokens[2];
+                                if (!ride.isAssigned()) {
+                                    ClientHandler chosenDriver = ride.assignDriver(driverUsername);
+                                    if (chosenDriver != null) {
+                                        ride.setAssigned(true);
+                                        out.println("RIDE_ASSIGNED:Driver " + driverUsername);
+                                        // Notify the chosen driver and mark them as busy
+                                        chosenDriver.sendMessage("ASSIGNED:" + rideId + ":You have been assigned a ride.");
+                                        chosenDriver.setBusy(true);
+                                        // Clear any pending offer for this ride from all drivers.
+                                        for (ClientHandler driverHandler : Server.drivers) {
+                                            if (driverHandler.getCurrentOfferRideId() == rideId) {
+                                                driverHandler.clearCurrentOffer();
+                                            }
+                                        }
+                                    } else {
+                                        out.println("ERROR: Driver not found in offers.");
+                                    }
+                                } else {
+                                    out.println("ERROR: Ride already assigned.");
+                                }
+                            } else {
+                                out.println("ERROR: Invalid ASSIGN format. Provide rideId and driver username.");
+                            }
+                        } else {
+                            out.println("ERROR: Only customers can assign rides.");
+                        }
+                        break;
+
+                    case "UPDATE":
+                        // Format: UPDATE:rideId:status (status can be START or END)
+                        if (user.getType().equalsIgnoreCase("driver")) {
+                            if (tokens.length >= 3) {
+                                int rideId;
+                                try {
+                                    rideId = Integer.parseInt(tokens[1]);
+                                } catch (NumberFormatException nfe) {
+                                    out.println("ERROR: Invalid rideId.");
+                                    break;
+                                }
+                                String status = tokens[2];
+                                Ride ride = Ride.getRideById(rideId);
+                                if (ride != null) {
+                                    // Check that the driver sending update is assigned to this ride.
+                                    if (ride.getAssignedDriver() == null ||
+                                            !ride.getAssignedDriver().getUser().getUsername().equalsIgnoreCase(getUserName())) {
+                                        out.println("ERROR: You are not assigned to ride " + rideId + ". Cannot update its status.");
+                                        break;
+                                    }
+                                    ride.updateStatus(status);
+                                    // Notify customer about status change.
+                                    ride.getCustomerHandler().sendMessage("UPDATE:" + rideId + ":" + status);
+                                    if (status.equalsIgnoreCase("END")) {
+                                        setBusy(false);
+                                    }
+                                    out.println("STATUS_UPDATED:" + rideId + ":" + status);
+                                } else {
+                                    out.println("ERROR: Ride not found.");
+                                }
+                            } else {
+                                out.println("ERROR: Invalid UPDATE format. Provide rideId and status.");
+                            }
+                        } else {
+                            out.println("ERROR: Only drivers can update ride status.");
+                        }
+                        break;
+
+                    case "RATE":
+                        // Format: RATE:rideId:behaviourRating:carRating:rideRating:comment
+                        if (user.getType().equalsIgnoreCase("customer")) {
+                            if (tokens.length >= 6) {
+                                int rideId;
+                                int behaviourRating, carRating, rideRating;
+                                try {
+                                    rideId = Integer.parseInt(tokens[1]);
+                                    behaviourRating = Integer.parseInt(tokens[2]);
+                                    carRating = Integer.parseInt(tokens[3]);
+                                    rideRating = Integer.parseInt(tokens[4]);
+                                } catch (NumberFormatException nfe) {
+                                    out.println("ERROR: Invalid rideId or rating values.");
+                                    break;
+                                }
+                                String comment = tokens[5];
+                                Ride ride = Ride.getRideById(rideId);
+                                if (ride != null && ride.isAssigned()) {
+                                    ClientHandler driverHandler = ride.getAssignedDriver();
+                                    // Calculate overall rating as the average of the three aspects.
+                                    double overallRating = (behaviourRating + carRating + rideRating) / 3.0;
+                                    driverHandler.getUser().addRating((int) overallRating);
+                                    String ratingMessage = "RATED: Ride " + rideId +
+                                            " rated with Behaviour: " + behaviourRating +
+                                            ", Car: " + carRating +
+                                            ", Ride: " + rideRating +
+                                            ". Comment: " + comment +
+                                            ". Overall new rating: " + driverHandler.getUser().getRating();
+                                    out.println(ratingMessage);
+                                    // Send rating details to the driver terminal.
+                                    driverHandler.sendMessage(ratingMessage);
+                                } else {
+                                    out.println("ERROR: Ride not found or not assigned.");
+                                }
+                            } else {
+                                out.println("ERROR: Invalid RATE format. Provide rideId, behaviourRating, carRating, rideRating, and comment.");
+                            }
+                        } else {
+                            out.println("ERROR: Only customers can rate drivers.");
+                        }
+                        break;
+
+                    case "STATS":
+                        // Only admin can request statistics.
+                        if (user.getType().equalsIgnoreCase("admin")) {
+                            StringBuilder stats = new StringBuilder("STATS:");
+                            stats.append("Total Users: ").append(Server.users.size()).append(" | ");
+                            stats.append("Total Customers: ").append(Server.customers.size()).append(" | ");
+                            stats.append("Total Drivers: ").append(Server.drivers.size()).append(" | ");
+                            stats.append("Total Rides: ").append(Server.rides.size()).append(" | ");
+                            // Ride status breakdown.
+                            long requested = Server.rides.stream().filter(r -> r.getStatus().equals("REQUESTED")).count();
+                            long assigned = Server.rides.stream().filter(r -> r.getStatus().equals("ASSIGNED")).count();
+                            long started = Server.rides.stream().filter(r -> r.getStatus().equals("START")).count();
+                            long ended = Server.rides.stream().filter(r -> r.getStatus().equals("END")).count();
+                            stats.append("Ride Statuses [REQUESTED:").append(requested)
+                                    .append(", ASSIGNED:").append(assigned)
+                                    .append(", START:").append(started)
+                                    .append(", END:").append(ended).append("]");
+                            out.println(stats.toString());
+                        } else {
+                            out.println("ERROR: Only admin can view statistics.");
+                        }
+                        break;
+
+                    case "DISCONNECT":
+                        // Do not allow disconnect if the client is in an ongoing ride.
+                        if (isInOngoingRide()) {
+                            out.println("ERROR: You are in an ongoing ride, cannot disconnect.");
+                        } else {
+                            out.println("DISCONNECTING");
+                            running = false;
+                        }
+                        break;
+
+                    default:
+                        out.println("ERROR: Unknown command.");
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("IOException in ClientHandler (" + getUserName() + "): " + e.getMessage());
+        } finally {
+            // Clean up when client disconnects.
+            try {
+                socket.close();
+            } catch(IOException e) { }
+            removeFromRoleList();
+            System.out.println("Connection closed for user: " + getUserName());
+        }
+    }
+
+    // Check if this client is in an ongoing ride (status START)
+    private boolean isInOngoingRide() {
+        return Server.rides.stream().anyMatch(r ->
+                ((r.getCustomerHandler() == this || (r.getAssignedDriver() != null && r.getAssignedDriver() == this))
+                        && r.getStatus().equals("START")));
+    }
+
+    private void addToRoleList() {
+        if (user.getType().equalsIgnoreCase("driver")) {
+            Server.drivers.add(this);
+        } else if (user.getType().equalsIgnoreCase("customer")) {
+            Server.customers.add(this);
+        }
+    }
+
+    private void removeFromRoleList() {
+        if (user != null) {
+            if (user.getType().equalsIgnoreCase("driver")) {
+                Server.drivers.remove(this);
+            } else if (user.getType().equalsIgnoreCase("customer")) {
+                Server.customers.remove(this);
+            }
+        }
+    }
+
+    private void broadcastRideRequest(Ride ride) {
+        // Send ride request to all free drivers.
+        boolean anyDriverAvailable = false;
+        for (ClientHandler driverHandler : Server.drivers) {
+            if (!driverHandler.isBusy()) {
+                driverHandler.sendMessage("NEW_RIDE:" + ride.getRideId() + ":" + ride.getPickup() + ":" + ride.getDestination());
+                anyDriverAvailable = true;
+            }
+        }
+        if (!anyDriverAvailable) {
+            // Inform the customer if no driver is free.
+            ride.getCustomerHandler().sendMessage("INFO: No drivers are currently available.");
+        }
+    }
+
+    public User getUser() {
+        return user;
+    }
+}
