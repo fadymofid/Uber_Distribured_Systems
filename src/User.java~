@@ -1,0 +1,67 @@
+import java.util.ArrayList;
+import java.util.List;
+
+public class User {
+    private String username;
+    private String password;
+    private String type;
+    private int rating = 0;
+    private int ratingCount = 0;
+
+    // Static list to store all users
+    private static List<User> allUsers = new ArrayList<>();
+
+    public User(String username, String password, String type) {
+        this.username = username;
+        this.password = password;
+        this.type = type.toLowerCase();
+        allUsers.add(this);
+    }
+
+    // New method to authenticate by username and password only
+    public static User authenticateByUsernamePassword(String username, String password) {
+        for (User user : allUsers) {
+            if (user.username.equals(username) && user.password.equals(password)) {
+                return user;
+            }
+        }
+        return null;
+    }
+
+    // Original method kept for backward compatibility if needed
+    public static User authenticate(String username, String password, String type) {
+        for (User user : allUsers) {
+            if (user.username.equals(username) &&
+                    user.password.equals(password) &&
+                    user.type.equalsIgnoreCase(type)) {
+                return user;
+            }
+        }
+        return null;
+    }
+
+    // Check if a username already exists
+    public static boolean userExists(String username) {
+        return allUsers.stream()
+                .anyMatch(user -> user.username.equals(username));
+    }
+
+    // Getters and other existing methods
+    public String getUsername() {
+        return username;
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    // Rating-related methods
+    public void addRating(int newRating) {
+        rating = ((rating * ratingCount) + newRating) / (ratingCount + 1);
+        ratingCount++;
+    }
+
+    public int getRating() {
+        return rating;
+    }
+}

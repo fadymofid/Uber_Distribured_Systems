@@ -5,6 +5,8 @@ public class User {
     private double rating = 0;
     private int ratingCount = 0;
 
+
+
     public User(String username, String password, String type) {
         this.username = username;
         this.password = password;
@@ -38,11 +40,10 @@ public class User {
     }
 
     // Authenticate user credentials based on username, password, and type.
-    public static User authenticate(String username, String password, String type) {
+    public static User authenticate(String username, String password) {
         return Server.users.stream()
                 .filter(u -> u.getUsername().equalsIgnoreCase(username) &&
-                        u.checkPassword(password) &&
-                        u.getType().equalsIgnoreCase(type))
+                        u.checkPassword(password))
                 .findFirst().orElse(null);
     }
 }

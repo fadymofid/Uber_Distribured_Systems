@@ -10,7 +10,7 @@ public class Ride {
     private ClientHandler customerHandler;
     private boolean assigned = false;
     private ClientHandler assignedDriver;
-    private String status = "REQUESTED"; // Possible statuses: REQUESTED, ASSIGNED, START, END, CANCELLED
+    private String status = "REQUESTED"; // Possible statuses: REQUESTED, ASSIGNED, START, END
     private boolean rated = false; // Flag to track if this ride has been rated.
     // Offers from drivers: key = driver username, value = fare offer
     private Map<String, Double> offers = new HashMap<>();
